@@ -1,2 +1,12 @@
 # IOT102_Gr2_IA1908
 Smart Anti-Theft System Project - Group 2_IA1908
+1. Key Features:
+- Phát hiện các chuyển động trong phạm vi chỉ định bằng (cảm biến PIR).
+- Khi có chuyển động, các tín hiệu sẽ truyền về Arduino và sẽ phát ra tín hiệu đến đèn LED và loa nhằm cảnh báo
+  + Cảnh báo bằng còi buzzer: Khi có chuyển động, buzzer phát tín hiệu cảnh báo, mô phỏng hệ thống báo động.
+  + Cảnh báo chớp bằng đèn: LED chớp tắt liên tục, khi phát hiện có chuyển động, nhằm hỗ trợ kiểm tra và cảnh báo đến người dùng.
+- Nâng cao: Dùng esp32 để thông báo về Blynk app khi có chuyển động.
+
+
+
+
