@@ -1,0 +1,647 @@
+Code Arduino:
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <EEPROM.h>
+#include <SoftwareSerial.h>
+
+
+// LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+
+// Keypad 4x4
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {10, 11, 12, 13};
+byte colPins[COLS] = {A0, A1, A2, A3};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+
+
+
+#define PASS_LENGTH 4
+#define MAX_USERS 3  // A, B, C
+
+
+
+
+// Người dùng và mật khẩu
+String userNames[MAX_USERS] = {"A", "B", "C"};
+
+
+
+
+//String passwords[USER_COUNT] = {"1234", "5678", "2468", "1357"};
+
+
+String inputPass = "";
+int currentUser = 0;
+int activatedBy = -1; //ở đây -1 là không rõ User nào
+                      //0: A, 1: B và 2: C
+bool isAuthenticated = false;
+bool changingPassword = false;
+
+
+
+
+// PIR sensors
+const int pirCount = 4;
+const int pirPins[pirCount] = {2, 3, 4, 5};
+
+
+
+
+// LED & Buzzer
+const int ledPin = 9;
+const int buzzerPin = 8;
+
+
+
+
+bool alarmActive = false;
+bool alarmTriggered = false;
+
+
+unsigned long lastBlink = 0;
+bool ledState = false;
+const unsigned long blinkInterval = 300;
+
+
+
+
+int motionCounter = 0;
+unsigned long lastMotionTime = 0;
+const int motionThreshold = 2;
+const unsigned long motionResetTime = 1000;
+unsigned long lastPirScan = 0;
+const unsigned long pirInterval = 100;
+
+
+const unsigned long pirBootTime = 3000;
+unsigned long startTime;
+bool pirReady = false;
+
+
+//Delay Input Pass To OFF
+int failCount = 0;
+unsigned long lockUntil = 0;
+
+
+
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+  pinMode(ledPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  for (int i = 0; i < pirCount; i++) pinMode(pirPins[i], INPUT);
+  Serial.begin(9600);
+  showUserPrompt();
+
+
+  initializeDefaultPasswords();
+
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Khoi dong PIR...");
+  startTime = millis();
+  pirReady = false;
+
+
+}
+void initializeDefaultPasswords() {
+  for (int u = 0; u < MAX_USERS; u++) {
+    bool empty = true;
+    int base = u * PASS_LENGTH;
+    for (int i = 0; i < PASS_LENGTH; i++) {
+      if (EEPROM.read(base + i) != 255) {
+        empty = false;
+        break;
+      }
+    }
+    if (empty) {
+      String defaultPass = "1234";
+      for (int i = 0; i < PASS_LENGTH; i++) {
+        EEPROM.write(base + i, defaultPass[i]);
+      }
+    }
+  }
+}
+
+
+void loop() {
+  if (!pirReady) { //đây là giai đoạn chờ PIR boot.
+    if (millis() - startTime >= pirBootTime) {
+      pirReady = true;
+      lcd.clear();
+      showUserPrompt();
+    } else {
+      char key = keypad.getKey();
+      if (key) {
+        if (key >= 'A' && key <= 'C') {
+          currentUser = key - 'A';
+          inputPass = "";
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Khoi dong PIR...");
+          lcd.setCursor(0, 1);
+          lcd.print("User: ");
+          lcd.print(userNames[currentUser]);
+        } else if (key == '*') {
+          inputPass = "";
+          lcd.setCursor(0, 1);
+          lcd.print("                ");
+        } else if (inputPass.length() < PASS_LENGTH && key != '#') {
+          inputPass += key;
+          lcd.setCursor(0, 1);
+          for (int i = 0; i < inputPass.length(); i++) lcd.print('*');
+          for (int i = inputPass.length(); i < PASS_LENGTH; i++) lcd.print(' ');
+        }
+      }
+      return;
+    }
+  }
+
+// Nếu hệ thống chưa bật → cho phép nhập pass để bật
+  if (!alarmActive) {
+    getPasswordInput();
+  } else { // Nếu hệ thống đã bật → theo dõi cảm biến + xử lý tắt còi
+    monitorSensors();
+    if (alarmTriggered) {
+      blinkAlarm();
+      getPasswordToDeactivate(); // Có kiểm tra sai pass + delay
+    }
+  }
+  checkRemoteCommands();  // Luôn kiểm tra các lệnh từ xa qua ESP (USER, PASS, NEWPASS, BLYNK_ON/OFF)
+}
+
+
+
+
+// ------------ HIỂN THỊ ------------
+void showUserPrompt() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Nhap Pass ");
+  lcd.print(userNames[currentUser]);
+  lcd.setCursor(0, 1);
+  inputPass = "";
+}
+
+void showPasswordStars(String pass) {
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < pass.length(); i++) lcd.print('*');
+  for (int i = pass.length(); i < PASS_LENGTH; i++) lcd.print(' ');
+}
+
+
+String readUserPasswordFromEEPROM(int user){
+  String pass = "";
+  int base = user * PASS_LENGTH;
+  for (int i = 0; i<PASS_LENGTH; i++){
+    char c = EEPROM.read(base + i);
+    if (c != 255){
+      pass += c;
+    }
+  }
+  pass.trim();
+  return pass;
+}
+
+void updateUserPasswordEEPROM(int user, String pass){
+  int base = user * PASS_LENGTH;
+  for (int i = 0; i<PASS_LENGTH; i++){
+    if(i < pass.length()) EEPROM.update(base + i, pass[i]);
+    else EEPROM.update(base + i, ' ');
+  }
+}
+
+// ------------ KÍCH HOẠT HỆ THỐNG ------------
+void getPasswordInput() {
+  char key = keypad.getKey();
+  if (key) {
+    if (key >= 'A' && key <= 'C') {
+      currentUser = key - 'A';
+      inputPass = "";
+      changingPassword = false;
+      showUserPrompt();
+    } else if (key == '#') {
+      String savePass= readUserPasswordFromEEPROM(currentUser);
+      if (!changingPassword){
+        if(inputPass == savePass) {
+        lcd.clear();
+        lcd.print("Dang kich hoat...");
+        delay(1000);
+        alarmActive = true;
+        isAuthenticated = true;
+        activatedBy = currentUser;
+        lcd.clear();
+        lcd.print("He thong chay");
+        Serial.println("STATUS:ON"); // đồng bô trạng thái ON trên ESP (Blynk)
+        Serial.println(activatedBy);
+        delay(1000);
+
+        lcd.clear();
+      } else {
+        lcd.clear();
+        lcd.print("Sai pass!");
+        delay(1000);
+        showUserPrompt();
+      //  inputPass = ""; bỏ
+      }
+    } else {
+      if (isAuthenticated){
+      updateUserPasswordEEPROM(currentUser, inputPass);
+      lcd.clear();
+      lcd.print("Da doi mat khau");
+      delay(1000);      
+      } else {
+        lcd.clear();
+        lcd.print("Chua xac thuc");
+        delay(1000);
+      }
+      changingPassword = false;
+      inputPass = "";
+      showUserPrompt();
+      }
+    } else if (key == '*') {
+      inputPass = "";
+      lcd.setCursor(0, 1);
+      lcd.print("              ");
+    } else if (key == 'D') {
+      changingPassword = true;
+      inputPass = "";
+      lcd.clear();
+      lcd.print("Doi mat khau:");
+      lcd.setCursor(0, 1);
+    } else if (inputPass.length() < PASS_LENGTH) {
+      inputPass += key;
+      showPasswordStars(inputPass);
+    }
+  }
+}
+
+unsigned long motionStartTime = 0;
+unsigned long lastMotionDetectedTime = 0;
+unsigned long motionAccumulatedTime = 0;
+bool inMotion = false;
+// ------------ GIÁM SÁT PIR ------------
+void monitorSensors() {
+  /*static unsigned long motionStartTime = 0;
+  static unsigned long lastMotionDetectedTime = 0;
+  unsigned long motionAccumulatedTime = 0;
+  static bool inMotion = false;*/
+
+  unsigned long now = millis();
+  if (alarmTriggered) return;
+
+  if (now - lastPirScan >= pirInterval) {
+    lastPirScan = now;
+    bool motionDetected = false;
+
+    for (int i = 0; i < pirCount; i++) {
+      if (digitalRead(pirPins[i]) == HIGH) {
+        motionDetected = true;
+        break;
+      }
+    }
+
+    if (motionDetected) {
+      if (!inMotion) {
+        inMotion = true;
+        motionStartTime = now;
+        Serial.println("Bat dau phat hien chuyen dong");
+      }
+      lastMotionDetectedTime = now;
+    } else {
+      if (inMotion) {
+        inMotion = false;
+        motionAccumulatedTime += now - motionStartTime;
+        Serial.print("Tich luy: ");
+        Serial.print(motionAccumulatedTime);
+        Serial.println(" ms");
+      }
+    }
+
+
+    // Nếu không thấy chuyển động >1s → reset
+    if (now - lastMotionDetectedTime > 5000 && motionAccumulatedTime > 0) {
+      Serial.println("Chuyen dong ket thuc som (<2s)");
+      motionAccumulatedTime = 0;
+    }
+
+    // Nếu đủ 2 giây tích lũy → báo động
+    if (motionAccumulatedTime >= 2000 && !alarmTriggered) {
+      alarmTriggered = true;
+      lcd.clear();
+      lcd.print("CANH BAO! XAM NHAP");
+      digitalWrite(ledPin, HIGH);
+      digitalWrite(buzzerPin, HIGH);
+      lastBlink = now;
+      Serial.println("CANH BAO: Chuyen dong keo dai");
+      notifyEspAlarmTriggered(activatedBy);
+    }
+  }
+}
+
+
+
+
+// ------------ NHẤP NHÁY CẢNH BÁO ------------
+void blinkAlarm() {
+  unsigned long now = millis();
+  if (now - lastBlink >= blinkInterval) {
+    lastBlink = now;
+    ledState = !ledState;
+    digitalWrite(ledPin, ledState);
+    digitalWrite(buzzerPin, ledState);
+  }
+}
+
+
+// ------------ TẮT HỆ THỐNG ------------
+void getPasswordToDeactivate() {
+  static String deactPass = "";
+  char key = keypad.getKey();
+  if (millis() < lockUntil) {
+    lcd.setCursor(0, 0);
+    lcd.print("Bi khoa, trong: ");
+    unsigned long remain = (lockUntil - millis()) / 1000;
+    lcd.setCursor(0, 1);
+    lcd.print(remain);
+    lcd.print("s          ");
+    delay(500);
+    return;
+  }
+
+
+  if (key) {
+    if (key >= 'A' && key <= 'C') {
+      currentUser = key - 'A';
+      deactPass = "";
+      lcd.clear();
+      lcd.print("Tat Pass ");
+      lcd.print(userNames[currentUser]);
+      lcd.setCursor(0, 1);
+    } else if (key == '#') {
+      String storedPass = readUserPasswordFromEEPROM(currentUser);
+      Serial.print("currentUser: "); Serial.println(currentUser);
+      Serial.print("activatedBy: "); Serial.println(activatedBy);
+      Serial.print("Nhap pass: "); Serial.println(deactPass);
+      Serial.print("Pass EEPROM: "); Serial.println(storedPass);
+
+      if (currentUser == activatedBy && deactPass == storedPass) {
+        lcd.clear();
+        lcd.print("Da tat he thong");
+        delay(1000);
+        alarmActive = false;
+        alarmTriggered = false;
+        motionStartTime = 0;
+        lastMotionDetectedTime = 0;
+        motionAccumulatedTime = 0;
+        inMotion = false;
+        digitalWrite(ledPin, LOW);
+        digitalWrite(buzzerPin, LOW);
+        motionCounter = 0;
+        ledState = false;
+        deactPass = "";
+        inputPass = "";
+        activatedBy = -1;
+        failCount = 0; //reset lại số lần nhập sai
+        lockUntil = 0; //reset lại tgian khóa (nhập sai)
+
+        showUserPrompt();
+        notifyEspAlarmDeactivated(); // Thông báo cho ESP8266
+        Serial.println("STATUS:OFF"); //đồng bộ trạng thái OFF cho esp (Blynk)
+      } else {
+        failCount++;
+        lockUntil = millis() + failCount*20000UL; //tăng 20s mỗi lần nhập sai
+        lcd.clear();
+        lcd.print("Sai pass hoac");
+        lcd.setCursor(0, 1);
+        lcd.print("khong co quyen");
+        delay(1500);
+        lcd.clear();
+        lcd.print("Tat Pass ");
+        lcd.print(userNames[currentUser]);
+        lcd.setCursor(0, 1);
+        deactPass = "";
+      }
+    } else if (key == '*') {
+      deactPass = "";
+      lcd.setCursor(0, 1);
+      lcd.print("                ");
+    } else if (deactPass.length() < PASS_LENGTH) {
+      deactPass += key;
+      lcd.setCursor(0, 1);
+      showPasswordStars(deactPass);
+    }
+  }
+}
+/*
+void checkRemoteCommands() {
+  static String espInput = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      espInput.trim();
+      Serial.print("Da nhan tu ESP: ");
+      Serial.println(espInput);
+
+      // ==== Xử lý login & bật ====
+      if (espInput.startsWith("LOGIN:")) {
+        int sep1 = espInput.indexOf(':');
+        int sep2 = espInput.indexOf(':', sep1 + 1);
+        if (sep2 > 0 && sep2 < espInput.length() - 1) {
+          char userChar = espInput.charAt(sep1 + 1);
+          String pass = espInput.substring(sep2 + 1);
+          int userIndex = userChar - 'A';
+
+          if (userIndex >= 0 && userIndex < MAX_USERS) {
+            String saved = readUserPasswordFromEEPROM(userIndex);
+            Serial.print("Pass nhan: "); Serial.println(pass);
+            Serial.print("Pass EEPROM: "); Serial.println(saved);
+
+            if (pass == saved) {
+              isAuthenticated = true;
+              activatedBy = userIndex;
+              currentUser = userIndex;
+              alarmActive = true;
+
+              lcd.clear(); lcd.print("Dang kich hoat...");
+              delay(1000);
+              lcd.clear(); lcd.print("He thong chay");
+              delay(1000);
+              lcd.clear();
+
+              Serial.println("STATUS:ON");
+              Serial.println(activatedBy);
+            } else {
+              isAuthenticated = false;
+              lcd.clear(); lcd.print("Sai pass!");
+              delay(1000);
+              Serial.println("AUTH_FAIL");
+            }
+          }
+        }
+
+      } else if (espInput == "BLYNK_OFF") {
+        if (isAuthenticated && currentUser == activatedBy) {
+          alarmActive = false;
+          alarmTriggered = false;
+          digitalWrite(ledPin, LOW);
+          digitalWrite(buzzerPin, LOW);
+          lcd.clear(); lcd.print("Tat tu xa!");
+          delay(1000);
+          Serial.println("STATUS:OFF");
+          notifyEspAlarmDeactivated();
+        } else {
+          lcd.clear(); lcd.print("Khong co quyen!");
+          delay(1000);
+          Serial.println("UNAUTHORIZED_OFF");
+        }
+      }
+
+      espInput = "";
+    } else {
+      espInput += c;
+    }
+  }
+}*/
+void checkRemoteCommands() {
+  static String espInput = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      espInput.trim();
+      Serial.print("Da nhan tu ESP: ");
+      Serial.println(espInput);
+
+      // ==== Xử lý login & bật ====
+      if (espInput.startsWith("LOGIN:")) {
+        int sep1 = espInput.indexOf(':');
+        int sep2 = espInput.indexOf(':', sep1 + 1);
+        if (sep2 > 0 && sep2 < espInput.length() - 1) {
+          char userChar = espInput.charAt(sep1 + 1);
+          String pass = espInput.substring(sep2 + 1);
+          int userIndex = userChar - 'A';
+
+          if (userIndex >= 0 && userIndex < MAX_USERS) {
+            String saved = readUserPasswordFromEEPROM(userIndex);
+            Serial.print("Pass nhan: "); Serial.println(pass);
+            Serial.print("Pass EEPROM: "); Serial.println(saved);
+
+            if (pass == saved) {
+              if (alarmActive && activatedBy != userIndex) {
+              // Có người khác đang bật rồi
+              lcd.clear(); lcd.print("Da kich hoat boi");
+              lcd.setCursor(0, 1); lcd.print(userNames[activatedBy]);
+              delay(1500);
+              Serial.println("LOGIN_REJECTED_BUSY");
+            } else {
+              isAuthenticated = true;
+              activatedBy = userIndex;
+              currentUser = userIndex;
+              alarmActive = true;
+
+              lcd.clear(); lcd.print("Dang kich hoat...");
+              delay(1000);
+              lcd.clear(); lcd.print("He thong chay");
+              delay(1000);
+              lcd.clear();
+
+              Serial.println("STATUS:ON");
+              Serial.println(activatedBy);
+            }
+          } else {
+              isAuthenticated = false;
+              lcd.clear(); lcd.print("Sai pass!");
+              delay(1000);
+              Serial.println("STATUS:FAILED");
+            }
+          }
+        }
+
+      // ==== Xử lý tắt từ xa có xác thực ====
+      } else if (espInput.startsWith("BLYNK_OFF:")) {
+        int sep1 = espInput.indexOf(':');
+        int sep2 = espInput.indexOf(':', sep1 + 1);
+        if (sep2 > 0 && sep2 < espInput.length() - 1) {
+          char userChar = espInput.charAt(sep1 + 1);
+          String pass = espInput.substring(sep2 + 1);
+          int userIndex = userChar - 'A';
+
+          if (userIndex >= 0 && userIndex < MAX_USERS) {
+            String storedPass = readUserPasswordFromEEPROM(userIndex);
+
+            if (userIndex == activatedBy && pass == storedPass) {
+              
+              lcd.clear(); lcd.print("Tat tu xa!");
+              delay(1000);
+              alarmActive = false;
+              alarmTriggered = false;
+              motionStartTime = 0;
+              lastMotionDetectedTime = 0;
+              motionAccumulatedTime = 0;
+              inMotion = false;
+              digitalWrite(ledPin, LOW);
+              digitalWrite(buzzerPin, LOW);
+              motionCounter = 0;
+              ledState = false;
+              //isAuthenticated = false;
+              activatedBy = -1;
+
+              failCount = 0; //reset lại số lần nhập sai
+              lockUntil = 0; //reset lại tgian khóa (nhập sai)
+
+              Serial.println("STATUS:OFF");
+              notifyEspAlarmDeactivated();
+            } else {
+              lcd.clear(); lcd.print("Sai pass");
+              Serial.println("STATUS:ON");
+              delay(1000);
+              Serial.println("UNAUTHORIZED_OFF");
+            }
+          } else {
+             // Không đúng user đang điều khiển
+            lcd.clear(); lcd.print("Khong co quyen!");
+            delay(1500);
+            Serial.println("STATUS:ON");
+            Serial.println("UNAUTHORIZED_OFF");
+          }
+        }
+
+      // ==== Nếu chỉ gửi "BLYNK_OFF" không có user/pass ====
+      } else if (espInput == "BLYNK_OFF") {
+        Serial.println("REJECTED_NO_CREDENTIALS");
+        Serial.println("STATUS:ON");
+        
+      }
+
+      espInput = "";
+    } else {
+      espInput += c;
+    }
+  }
+}
+
+
+// ------------ GỬI TÍN HIỆU CHO ESP8266 ------------
+void notifyEspAlarmTriggered(int userIndex) {
+  Serial.print("ALARM:");
+  Serial.println(userIndex);
+}
+
+
+void notifyEspAlarmDeactivated() {
+  Serial.println("ALARM:OFF");
+}
+
