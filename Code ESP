@@ -1,0 +1,110 @@
+Code ESP:
+#define BLYNK_TEMPLATE_ID "TMPL6kgxPenQI"
+#define BLYNK_TEMPLATE_NAME "HeThongCanhBao"
+#define BLYNK_AUTH_TOKEN "p0cATIRyWP1iCVXwHUIu-4a92Zb61ZNV"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+char ssid[] = "PG09";
+char pass[] = "soiden022509";
+
+BlynkTimer timer;
+String inputData = "";
+String selectedUser = "";
+String inputPassword = "";
+String newPassword = "";
+bool isAuthenticated = false;
+bool systemState = false; // true = ON, false = OFF
+
+
+// Chọn user từ Blynk (V1)
+BLYNK_WRITE(V1) {
+  selectedUser = param.asStr(); // A, B, C
+  Serial.println("USER:" + selectedUser);
+  delay(200);
+}
+// Nhập mật khẩu từ Blynk (V3)
+BLYNK_WRITE(V3) {
+  inputPassword = param.asStr();
+  Serial.println("PASS:" + inputPassword);
+}
+
+// Switch bật/tắt hệ thống từ Blynk (V4)
+BLYNK_WRITE(V4) {
+  int state = param.asInt(); // 1 = ON, 0 = OFF
+  if (state == 1 && !systemState) {
+    if (!selectedUser.isEmpty() && !inputPassword.isEmpty()) {
+      // Gửi yêu cầu bật hệ thống kèm user & pass
+      Serial.println("LOGIN:" + selectedUser + ":" + inputPassword);
+      Blynk.virtualWrite(V5, "Đang kiểm tra mật khẩu...");
+    } else {
+      Blynk.virtualWrite(V5, "Vui lòng nhập user và mật khẩu");
+      Blynk.virtualWrite(V4, 0); // Reset lại công tắc
+    }
+  } else if (state == 0 && systemState) {
+      if (!selectedUser.isEmpty() && !inputPassword.isEmpty()) {
+        // Gửi yêu cầu tắt hệ thống kèm user & pass
+        Serial.println("BLYNK_OFF:" + selectedUser + ":" + inputPassword);
+        Blynk.virtualWrite(V5, "Đang xác thực tắt hệ thống...");
+      } else {
+        Blynk.virtualWrite(V5, "Vui lòng nhập user và mật khẩu");
+        Blynk.virtualWrite(V4, 1); // Reset lại công tắc về ON nếu nhập sai
+      }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  timer.setInterval(30000L, reconnectBlynk);
+  Serial.println("ESP8266 sẵn sàng nhận tín hiệu từ Arduino...");
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  // Nhận tín hiệu từ Arduino
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      inputData.trim();
+      if (inputData.startsWith("ALARM:")) {
+        String payload = inputData.substring(6);
+        if (payload == "OFF") {
+          Blynk.virtualWrite(V0, "Cảnh báo đã tắt");
+        } else {
+          String msg = "Xâm nhập! Người dùng " + payload;
+          Blynk.virtualWrite(V0, msg);
+          Blynk.logEvent("intrusion_detected", msg);
+        }
+      } else if (inputData == "STATUS:ON") {
+        systemState = true;
+        isAuthenticated = true;
+        Blynk.virtualWrite(V4, 1);
+        Blynk.virtualWrite(V5, "Đã xác thực & bật hệ thống");
+      } else if (inputData == "STATUS:OFF") {
+        systemState = false;
+        Blynk.virtualWrite(V4, 0);
+        Blynk.virtualWrite(V5, "Đã tắt hệ thống");
+      }
+  else if (inputData == "STATUS:FAILED") {
+isAuthenticated = false;
+     Blynk.virtualWrite(V5, "Sai mật khẩu. Bật thất bại");
+     Blynk.virtualWrite(V4, 0); // Reset lại công tắc
+}
+
+      inputData = "";
+    } else {
+      inputData += c;
+    }
+  }
+}
+void reconnectBlynk() {
+  if (!Blynk.connected()) {
+    Blynk.connect();
+  }
+}
+
+
